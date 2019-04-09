@@ -124,9 +124,12 @@ namespace Orleans.Streams
 
     }
 
-    public interface IPoisonEventHandler : IStreamMonitor
+    public interface IErrorHandler : IStreamMonitor
     {
-        bool ClassifyEventPoisonStatus(StreamSequenceToken token);
+        bool ClassifyPoisonStatus(StreamSequenceToken token, Exception exception);
+
+        // TODO: Consider merging with the above method using tuples or out params
+        TimeSpan GetRecoveryBackoff(StreamSequenceToken token, Exception exception);
     }
 
     public interface IActivityTracker : IStreamMonitor
@@ -144,7 +147,6 @@ namespace Orleans.Streams
     }
 
     // TODO: Mega TODOs
-    //   - Recovery backoff
     //   - Idle detection via timers and lifecycle control
     //   - Graceful limping (cut until we need it but then it'll probably be a "context" that we tack on to OnNext())
     // TODO: Potential conflict between grain timeout and timer frequencies. Possible to warn or even delay?
@@ -160,6 +162,10 @@ namespace Orleans.Streams
 
         private IRecoverableStreamProcessor<TState, TEvent> processor;
         private IRecoverableStreamStorage<TState> storage;
+        private IErrorHandler errorHandler;
+        private IActivityTracker activityTracker;
+
+        private bool ignoreEvents;
 
         public RecoverableStream(IStreamProvider streamProvider, IStreamIdentity streamId, IGrainActivationContext context, ILogger<RecoverableStream<TState, TEvent>> logger, IGrainRuntime grainRuntime, IProviderRuntime providerRuntime)
         {
@@ -299,8 +305,22 @@ namespace Orleans.Streams
             return this.CheckpointIfOverdue();
         }
 
+        private async Task OnRecoveryTimer(IDisposable timer, object state)
+        {
+            await this.Recover();
+
+            this.ignoreEvents = false;
+
+            timer.Dispose();
+        }
+
         private async Task OnNext(TEvent @event, StreamSequenceToken token)
         {
+            if (this.ignoreEvents)
+            {
+                return;
+            }
+
             try
             {
                 if (this.storage.State.IsDuplicateEvent(token))
@@ -346,15 +366,31 @@ namespace Orleans.Streams
                 // TODO: Log
                 Console.WriteLine(exception);
 
-                await this.storage.Load();
+                var isPoison = this.errorHandler.ClassifyPoisonStatus(token, exception);
 
-                // TODO: Should we have OnRecovery recovery?
-                await this.processor.OnRecovery(this.storage.State.ApplicationState, token);
+                if (!isPoison)
+                {
+                    var backoff = this.errorHandler.GetRecoveryBackoff(token, exception);
 
-                await this.Subscribe(this.storage.State.GetToken());
+                    if (backoff <= TimeSpan.Zero)
+                    {
+                        // TODO: Error handling. Or maybe just let the timer drive the retries?
+                        await this.Recover();
+                    }
+                    else
+                    {
+                        this.ignoreEvents = true;
 
-                // TODO: Hm. If there are other batches queued for delivery outside the grain, will those get delivered first? Are the streaming extensions smarter than that?
-                // TODO: Do we actually need to throw here? We requested a rewind, shouldn't that be sufficient?
+                        this.timerManager.RegisterReentrantTimer(this.OnRecoveryTimer, null, backoff, TimeSpan.FromSeconds(5));
+                    }
+
+                    // TODO: Validate that we don't want to throw here. We don't care to get the event redelivered because we either want to rewind or ignore then eventually rewind.
+                }
+                else
+                {
+                    // TODO: Recovery?
+                    await this.processor.OnError(this.storage.State.ApplicationState, token, exception, new PoisonEventErrorArgs());
+                }
             }
         }
 
@@ -395,6 +431,18 @@ namespace Orleans.Streams
             }
 
             return fastForwardRequested;
+        }
+
+        private async Task Recover()
+        {
+            await this.storage.Load();
+
+            // TODO: Should we have OnRecovery recovery?
+            await this.processor.OnRecovery(this.storage.State.ApplicationState, this.storage.State.GetToken());
+
+            await this.Subscribe(this.storage.State.GetToken());
+
+            // TODO: Hm. If there are other batches queued for delivery outside the grain, will those get delivered first? Are the streaming extensions smarter than that?
         }
 
         private Task OnError(Exception exception)
