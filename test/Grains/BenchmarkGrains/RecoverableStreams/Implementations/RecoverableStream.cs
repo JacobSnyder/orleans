@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Orleans.CodeGeneration;
+using Orleans.Providers;
 using Orleans.Runtime;
 using Orleans.Streams;
 
@@ -28,6 +29,11 @@ namespace Orleans.Streams
     public interface INonReentrantTimerCallbackGrainExtension : IGrainExtension
     {
         Task OnNonReentrantTimer(object state);
+    }
+
+    public interface IDeactivateGrainExtension : IGrainExtension
+    {
+        Task Deactivate();
     }
 
     public interface ISubscriptionHandler
@@ -147,13 +153,15 @@ namespace Orleans.Streams
         private readonly IStreamProvider streamProvider;
         private readonly ILogger logger;
         private readonly IGrainActivationContext context;
-        private readonly IGrainRuntime runtime;
+        private readonly IGrainRuntime grainRuntime;
+        private readonly IProviderRuntime providerRuntime;
         private readonly IAdvancedTimerManager timerManager; // TODO: Instantiate me using all kinds of crazy Orleans stuff
+        private readonly IDeactivateGrainExtension deactivateGrainExtension; // TODO: Instantiate me using all kinds of crazy Orleans stuff
 
         private IRecoverableStreamProcessor<TState, TEvent> processor;
         private IRecoverableStreamStorage<TState> storage;
 
-        public RecoverableStream(IStreamProvider streamProvider, IStreamIdentity streamId, IGrainActivationContext context, ILogger<RecoverableStream<TState, TEvent>> logger, IGrainRuntime runtime)
+        public RecoverableStream(IStreamProvider streamProvider, IStreamIdentity streamId, IGrainActivationContext context, ILogger<RecoverableStream<TState, TEvent>> logger, IGrainRuntime grainRuntime, IProviderRuntime providerRuntime)
         {
             if (streamProvider == null) { throw new ArgumentNullException(nameof(streamProvider)); }
             if (!streamProvider.IsRewindable) { throw new ArgumentException("Stream Provider must be Rewindable", nameof(streamProvider)); }
@@ -164,13 +172,16 @@ namespace Orleans.Streams
 
             if (logger == null) { throw new ArgumentNullException(nameof(logger)); }
 
-            if (runtime == null) { throw new ArgumentNullException(nameof(runtime)); }
+            if (grainRuntime == null) { throw new ArgumentNullException(nameof(grainRuntime)); }
+
+            if (providerRuntime == null) { throw new ArgumentNullException(nameof(providerRuntime)); }
 
             this.streamProvider = streamProvider;
             this.StreamId = streamId;
             this.context = context;
             this.logger = logger;
-            this.runtime = runtime;
+            this.grainRuntime = grainRuntime;
+            this.providerRuntime = providerRuntime;
         }
 
         public IStreamIdentity StreamId { get; }
@@ -233,7 +244,6 @@ namespace Orleans.Streams
 
             if (!this.storage.State.IsIdle)
             {
-                // TODO: Get current token
                 await this.Subscribe(this.storage.State.GetToken());
             }
             else
@@ -242,7 +252,7 @@ namespace Orleans.Streams
             }
 
             // TODO: Apply jitter to timer registration
-            this.timerManager.RegisterReentrantTimer(this.OnCheckpointTimer, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+            this.timerManager.RegisterReentrantTimer(this.OnCheckpointTimer, null, this.storage.TimerPeriod, this.storage.TimerPeriod);
 
             // TODO: Recovery?
             await this.processor.OnSetup(this.storage.State.ApplicationState, this.storage.State.GetToken());

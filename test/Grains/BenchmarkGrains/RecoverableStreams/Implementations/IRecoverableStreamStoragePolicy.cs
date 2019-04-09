@@ -4,6 +4,8 @@ namespace Orleans.Streams
 {
     public interface IRecoverableStreamStoragePolicy
     {
+        TimeSpan CheckpointTimerPeriod { get; }
+
         TimeSpan GetNextCheckpoint(int checkpointAttemptCount);
 
         int GetCheckpointSubAttemptCount(int checkpointAttemptCount); // TODO: Improve naming

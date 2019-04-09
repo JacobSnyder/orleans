@@ -30,6 +30,8 @@ namespace Orleans.Streams
 
         public RecoverableStreamState<TState> State { get; set; }
 
+        public TimeSpan TimerPeriod => this.policy.CheckpointTimerPeriod;
+
         public async Task Load()
         {
             int attempts = 0;
