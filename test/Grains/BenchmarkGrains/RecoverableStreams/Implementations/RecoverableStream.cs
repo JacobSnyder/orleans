@@ -96,34 +96,6 @@ namespace Orleans.Streams
         }
     }
 
-    public interface IRecoveryBackoffPolicy : IStreamMonitor
-    {
-        TimeSpan GetBackoff();
-    }
-
-    public class BasicRecoveryBackoffPolicy : StreamMonitorBase, IRecoveryBackoffPolicy
-    {
-        private StreamSequenceToken recoverySequenceToken;
-        private int recoveryCount;
-        
-        public override void NotifyRecovery(StreamSequenceToken token)
-        {
-            if (this.recoverySequenceToken == null || !token.Equals(this.recoverySequenceToken))
-            {
-                this.recoverySequenceToken = token;
-                this.recoveryCount = 0;
-            }
-
-            ++this.recoveryCount;
-        }
-
-        public TimeSpan GetBackoff()
-        {
-            return TimeSpan.FromSeconds(5 * (this.recoveryCount- 1));
-        }
-
-    }
-
     public interface IErrorHandler : IStreamMonitor
     {
         bool ClassifyPoisonStatus(StreamSequenceToken token, Exception exception);
@@ -134,6 +106,8 @@ namespace Orleans.Streams
 
     public interface IActivityTracker : IStreamMonitor
     {
+        TimeSpan TimerPeriod { get; }
+
 
     }
 
@@ -143,7 +117,15 @@ namespace Orleans.Streams
     {
         IDisposable RegisterReentrantTimer(AdvancedTimerCallback callback, object state, TimeSpan dueTime, TimeSpan period);
 
+        // TODO: Find better names. I accidentally used the reentrant version because picking the "non" version isn't natural.
         IDisposable RegisterNonReentrantTimer(AdvancedTimerCallback callback, object state, TimeSpan dueTime, TimeSpan period);
+    }
+
+    public enum RecoverableStreamActivityState
+    {
+        Inactive,
+        Active,
+        RecoveryBackoff,
     }
 
     // TODO: Mega TODOs
@@ -165,7 +147,8 @@ namespace Orleans.Streams
         private IErrorHandler errorHandler;
         private IActivityTracker activityTracker;
 
-        private bool ignoreEvents;
+        private RecoverableStreamActivityState streamActivityState;
+        private DateTime? lastEventReceived;
 
         public RecoverableStream(IStreamProvider streamProvider, IStreamIdentity streamId, IGrainActivationContext context, ILogger<RecoverableStream<TState, TEvent>> logger, IGrainRuntime grainRuntime, IProviderRuntime providerRuntime)
         {
@@ -258,7 +241,8 @@ namespace Orleans.Streams
             }
 
             // TODO: Apply jitter to timer registration
-            this.timerManager.RegisterReentrantTimer(this.OnCheckpointTimer, null, this.storage.TimerPeriod, this.storage.TimerPeriod);
+            // TODO: Evaluate if there's a perf difference. Should we keep a timer ticking that we don't always care about? Or should we unregister it when we're not using it? Put a different way, is there contention on changing timer registration? If not then we get the nice ability to have this timer tick exactly when we need it.
+            this.timerManager.RegisterNonReentrantTimer(this.OnCheckpointTimer, null, this.storage.TimerPeriod, this.storage.TimerPeriod);
 
             // TODO: Recovery?
             await this.processor.OnSetup(this.storage.State.ApplicationState, this.storage.State.GetToken());
@@ -268,6 +252,59 @@ namespace Orleans.Streams
         {
             // TODO: Best effort save and log if it didn't work. Don't set idle if it's not time.
             return Task.CompletedTask;
+        }
+
+        private bool EvaluateAndUpdateActivityOnEvent()
+        {
+            this.lastEventReceived = DateTime.UtcNow;
+
+            switch (this.streamActivityState)
+            {
+                case RecoverableStreamActivityState.Inactive:
+                {
+                    this.streamActivityState = RecoverableStreamActivityState.Active;
+                    return true;
+                }
+                case RecoverableStreamActivityState.Active:
+                case RecoverableStreamActivityState.RecoveryBackoff:
+                {
+                    return true;
+                }
+                default:
+                {
+                    throw new NotSupportedException($"Unknown {nameof(RecoverableStreamActivityState)} '{this.streamActivityState}'");
+                }
+            }
+        }
+
+        public bool EvaluateAndUpdateInactivityOnActivityTracker()
+        {
+            switch (this.streamActivityState)
+            {
+                case RecoverableStreamActivityState.Inactive:
+                {
+                    return false;
+                }
+                case RecoverableStreamActivityState.Active:
+                {
+                    if (DateTime.UtcNow - this.lastEventReceived < TimeSpan.FromMinutes(15)) // TODO: Config
+                    {
+                        return false;
+                    }
+
+                    this.streamActivityState = RecoverableStreamActivityState.Inactive;
+
+                    return true;
+                }
+                case RecoverableStreamActivityState.RecoveryBackoff:
+                {
+                    return true;
+                }
+                default:
+                {
+                    throw new NotSupportedException($"Unknown {nameof(RecoverableStreamActivityState)} '{this.streamActivityState}'");
+                }
+            }
         }
 
         private async Task Subscribe(StreamSequenceToken sequenceToken)
@@ -309,7 +346,8 @@ namespace Orleans.Streams
         {
             await this.Recover();
 
-            this.ignoreEvents = false;
+            this.streamActivityState = RecoverableStreamActivityState.Active;
+            this.lastEventReceived = DateTime.UtcNow;
 
             timer.Dispose();
         }
@@ -330,6 +368,8 @@ namespace Orleans.Streams
 
                 if (this.storage.State.StartToken == null || this.storage.State.IsIdle)
                 {
+                    // TODO: If we're leaving Idle, we should probably check to make sure the token isn't a dupe.
+
                     this.storage.State.ResetTokens();
                     this.storage.State.SetStartToken(token);
 

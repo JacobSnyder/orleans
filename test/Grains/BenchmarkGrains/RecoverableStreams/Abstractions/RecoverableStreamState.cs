@@ -25,7 +25,7 @@ namespace Orleans.Streams
         public IStreamIdentity StreamId { get; set; }
         public StreamSequenceToken StartToken { get; private set; } // TODO: Saving this in the past has been a nightmare because of abstract base classes. Considering adding "serialize" method to this directly.
         public StreamSequenceToken CurrentToken { get; private set; }
-        public bool IsIdle { get; set; }
+        public bool IsIdle { get; set; } // TODO: Consider inverting to "IsActive". This might allow us to simplify the condition when we're first streaming.
         public TApplicationState ApplicationState { get; set; }
 
         /// <summary>
