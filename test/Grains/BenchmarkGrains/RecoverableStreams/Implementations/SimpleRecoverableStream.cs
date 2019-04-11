@@ -24,13 +24,14 @@ namespace Orleans.Streams
 
         Task OnFastForwardAsync(TState readonlyState, StreamSequenceToken token);
 
+        Task OnRecoveryAsync(TState readonlyState, StreamSequenceToken token, TEvent @event);
+
         Task OnErrorAsync(TState readonlyState, StreamSequenceToken token, Exception exception);
     }
 
     // TODO List:
     //   - Logging
     //   - Context scopes (Activity ID, AutoEvents context, etc.)
-    //   - Recovery
     //   - Grain
     public class SimpleRecoverableStream<TState, TEvent>
         where TState : new()
@@ -96,8 +97,6 @@ namespace Orleans.Streams
                 };
             }
 
-            var token = this.storage.State.GetToken();
-
             await this.SubscribeAsync();
 
             await this.processor.OnActivateAsync(this.storage.State.ApplicationState, this.storage.State.GetToken());
@@ -117,40 +116,58 @@ namespace Orleans.Streams
         {
             this.CheckProcessorAttached();
 
-            if (this.storage.State.IsDuplicateEvent(token))
+            try
             {
-                return;
-            }
-
-            // Save the start token so that if we enter recovery the token isn't null
-            if (this.storage.State.StartToken == null)
-            {
-                this.storage.State.SetStartToken(token);
-
-                var saveFastForwarded = await this.SaveAsync();
-
-                if (saveFastForwarded)
+                if (this.storage.State.IsDuplicateEvent(token))
                 {
-                    // We fast-forwarded so it's possible that we skipped over this event and it is now considered a duplicate. Reevaluate its duplicate status.
-                    if (this.storage.State.IsDuplicateEvent(token))
+                    return;
+                }
+
+                // Save the start token so that if we enter recovery the token isn't null
+                if (this.storage.State.StartToken == null)
+                {
+                    this.storage.State.SetStartToken(token);
+
+                    var saveFastForwarded = await this.SaveAsync();
+
+                    if (saveFastForwarded)
                     {
-                        return;
+                        // We fast-forwarded so it's possible that we skipped over this event and it is now considered a duplicate. Reevaluate its duplicate status.
+                        if (this.storage.State.IsDuplicateEvent(token))
+                        {
+                            return;
+                        }
                     }
                 }
+
+                this.storage.State.SetCurrentToken(token);
+
+                var processorRequestsSave =
+                    await this.processor.OnEventAsync(this.storage.State.ApplicationState, token, @event);
+
+                if (processorRequestsSave)
+                {
+                    await this.SaveAsync();
+                }
+                else
+                {
+                    await this.CheckpointIfOverdueAsync();
+                }
             }
-
-            this.storage.State.SetCurrentToken(token);
-
-            var processorRequestsSave =
-                await this.processor.OnEventAsync(this.storage.State.ApplicationState, token, @event);
-
-            if (processorRequestsSave)
+            catch
             {
-                await this.SaveAsync();
-            }
-            else
-            {
-                await this.CheckpointIfOverdueAsync();
+                try
+                {
+                    await this.processor.OnRecoveryAsync(this.storage.State.ApplicationState, token, @event);
+                }
+                catch
+                {
+                    // Log
+                }
+
+                this.orleansHooks.DeactivateOnIdle();
+
+                throw;
             }
         }
 
@@ -158,6 +175,8 @@ namespace Orleans.Streams
         {
             this.CheckProcessorAttached();
 
+            // TODO: What happens if we throw out of OnError() to Orleans?
+            // TODO: In the future we might want to consider throwing out the current game. But that would mean changing the state outside of event delivery. We're treating that as out-of-scope for now.
             return this.processor.OnErrorAsync(this.storage.State.ApplicationState, this.storage.State.GetToken(), exception);
         }
 
