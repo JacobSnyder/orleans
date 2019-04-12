@@ -79,20 +79,9 @@ namespace Orleans.Streams
         }
     }
 
-    // For now, we assume that the only things that are allowed to modify state is the method that returns a bool, OnEvent(). Everything else is just for notification purposes only and allows implementations to initialize and cleanup processing (e.g. Aggregates or Dynamic Stats). Going forward we will consider expanding this. This reasons for this restriction are two-fold. First, we want to keep the scope of this initial implementation manageable. Secondly, there are deployment concerns. The current assumption is that the state will be equivalent given matching sequence tokens. If we start to modify state outside of OnEvent(), we will be modifying the state without changing the sequence token, thus violating this assumption. We will need a way to resolve that (potentially by implementing some kind of tie-breaking mechanism either by incrementing a "sub-token" or by persisting out the various "additional" actions that get invoked).
     public interface ISimpleRecoverableStreamProcessor<TState, TEvent>
     {
-        Task OnActivateAsync(TState readonlyState, StreamSequenceToken token);
-
-        Task<bool> OnEventAsync(TState state, StreamSequenceToken token, TEvent @event);
-
-        Task OnDeactivateAsync(TState readonlyState, StreamSequenceToken token);
-
-        Task OnFastForwardAsync(TState readonlyState, StreamSequenceToken token);
-
-        Task OnRecoveryAsync(TState readonlyState, StreamSequenceToken token, TEvent @event);
-
-        Task OnErrorAsync(TState readonlyState, StreamSequenceToken token, Exception exception);
+        Task<bool> OnEventAsync(TState state, TEvent @event);
     }
 
     public interface ISimpleRecoverableStream<TState, TEvent> where TState : new()
@@ -179,18 +168,14 @@ namespace Orleans.Streams
             }
 
             await this.SubscribeAsync();
-
-            await this.processor.OnActivateAsync(this.storage.State.ApplicationState, this.storage.State.GetToken());
         }
 
-        public async Task OnDeactivateAsync()
+        public Task OnDeactivateAsync()
         {
             this.CheckProcessorAttached();
 
-            await this.processor.OnDeactivateAsync(this.storage.State.ApplicationState, this.storage.State.GetToken());
-
             // TODO: Add an optimization where this doesn't save unless the token is different
-            await this.storage.Save();
+            return this.storage.Save();
         }
 
         public async Task OnEventAsync(TEvent @event, StreamSequenceToken token)
@@ -223,8 +208,7 @@ namespace Orleans.Streams
 
                 this.storage.State.SetCurrentToken(token);
 
-                var processorRequestsSave =
-                    await this.processor.OnEventAsync(this.storage.State.ApplicationState, token, @event);
+                var processorRequestsSave = await this.processor.OnEventAsync(this.storage.State.ApplicationState, @event);
 
                 if (processorRequestsSave)
                 {
@@ -237,15 +221,6 @@ namespace Orleans.Streams
             }
             catch
             {
-                try
-                {
-                    await this.processor.OnRecoveryAsync(this.storage.State.ApplicationState, token, @event);
-                }
-                catch
-                {
-                    // Log
-                }
-
                 this.orleansHooks.DeactivateOnIdle();
 
                 throw;
@@ -254,11 +229,7 @@ namespace Orleans.Streams
 
         public Task OnErrorAsync(Exception exception)
         {
-            this.CheckProcessorAttached();
-
-            // TODO: What happens if we throw out of OnError() to Orleans?
-            // TODO: In the future we might want to consider throwing out the current game. But that would mean changing the state outside of event delivery. We're treating that as out-of-scope for now.
-            return this.processor.OnErrorAsync(this.storage.State.ApplicationState, this.storage.State.GetToken(), exception);
+            return Task.CompletedTask;
         }
 
         private void CheckProcessorAttached()
@@ -271,7 +242,7 @@ namespace Orleans.Streams
 
         private Task SubscribeAsync()
         {
-            return this.orleansHooks.SubscribeAsync(this.OnEventAsync, this.OnErrorAsync, this.storage.State.GetToken());
+            return this.orleansHooks.SubscribeAsync(this.StreamId, this.OnEventAsync, this.OnErrorAsync, this.storage.State.GetToken());
         }
 
         private Task<bool> CheckpointIfOverdueAsync()
@@ -300,9 +271,6 @@ namespace Orleans.Streams
             if (fastForwardRequested)
             {
                 await this.SubscribeAsync();
-
-                await this.processor.OnFastForwardAsync(this.storage.State.ApplicationState,
-                    this.storage.State.GetToken());
             }
 
             return fastForwardRequested;
@@ -329,7 +297,7 @@ namespace Orleans.Streams
             return Task.CompletedTask;
         }
 
-        public virtual Task<bool> OnEventAsync(TState state, StreamSequenceToken token, TEvent @event)
+        public virtual Task<bool> OnEventAsync(TState state, TEvent @event)
         {
             return Task.FromResult(false);
         }
@@ -357,24 +325,10 @@ namespace Orleans.Streams
 
     public class HaloStreamProcessor : SimpleRecoverableStreamProcessorBase<SimpleState, SimpleEvent>
     {
-        public override Task OnActivateAsync(SimpleState readonlyState, StreamSequenceToken token)
+        public override Task<bool> OnEventAsync(SimpleState state, SimpleEvent @event)
         {
-            // TODO: Setup dynamic stats if there is existing state
-            throw new NotImplementedException();
-        }
-
-        public override Task<bool> OnEventAsync(SimpleState state, StreamSequenceToken token, SimpleEvent @event)
-        {
-            // TODO: Setup dynamic stats if there isn't one
-            // TODO: Consider validating that the state is the same as the one we setup dynamic stats for
+            // TODO: Setup if dynamic stats isn't setup or state is different, setup dynamic stats
             // TODO: Ingest event into dynamic stats
-            throw new NotImplementedException();
-        }
-
-        public override Task OnFastForwardAsync(SimpleState readonlyState, StreamSequenceToken token)
-        {
-            // TODO: Throw out current dynamic stats if there is one
-            // TODO: Setup dynamic stats if there is an existing state
             throw new NotImplementedException();
         }
     }
@@ -416,7 +370,7 @@ namespace Orleans.Streams
         {
             if (grainActivationContext == null) { throw new ArgumentNullException(nameof(grainActivationContext)); }
 
-            // TODO: I'm not sure if this is set by default or if we need to opt-in
+            // TODO: I'm not sure if this is set by default or if we need to opt-in and configure Orleans shenanigans
             Guid streamGuid = grainActivationContext.GrainIdentity.GetPrimaryKey(out string streamNamespace);
             var streamId = new StreamIdentity(streamGuid, streamNamespace);
 
