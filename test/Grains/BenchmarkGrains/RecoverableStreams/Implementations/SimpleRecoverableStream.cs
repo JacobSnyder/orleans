@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Orleans.Runtime;
 
@@ -100,16 +101,193 @@ namespace Orleans.Streams
         Task OnDeactivateAsync();
     }
 
+    public sealed class RecoverableStreamLogger<TLogContext, TState> : IDisposable
+        where TLogContext : IDisposable
+    {
+        private readonly IRecoverableStreamLogs<TLogContext, TState> logs;
+
+        private readonly IStreamIdentity streamId;
+        private readonly string methodName;
+        private StreamSequenceToken lastToken;
+        private StreamSequenceToken currentToken;
+        private TState state;
+
+        private TLogContext context;
+
+        public RecoverableStreamLogger(
+            IRecoverableStreamLogs<TLogContext, TState> logs,
+            RecoverableStreamState<TState> streamState,
+            string methodName,
+            StreamSequenceToken currentToken)
+        {
+            if (logs == null) { throw new ArgumentNullException(nameof(logs)); }
+            this.ValidateStreamState(streamState);
+            if (methodName == null) { throw new ArgumentNullException(nameof(methodName)); }
+
+            this.logs = logs;
+
+            this.streamId = streamState?.StreamId;
+            this.methodName = methodName;
+            this.lastToken = streamState?.GetToken();
+            this.currentToken = currentToken;
+
+            if (streamState != null)
+            {
+                this.state = streamState.ApplicationState;
+            }
+
+            this.Refresh();
+        }
+
+        public IStreamIdentity StreamId => this.streamId;
+
+        public string MethodName => this.methodName;
+
+        public StreamSequenceToken LastToken
+        {
+            get => this.lastToken;
+            set
+            {
+                this.lastToken = value;
+                this.Refresh();
+            }
+        }
+
+        public StreamSequenceToken CurrentToken
+        {
+            get => this.currentToken;
+            set
+            {
+                this.currentToken = value;
+                this.Refresh();
+            }
+        }
+
+        public TState State
+        {
+            get => this.state;
+            set
+            {
+                this.state = value;
+                this.Refresh();
+            }
+        }
+
+        public void Dispose()
+        {
+            this.Close();
+        }
+
+        private void Open()
+        {
+            if (this.context != null)
+            {
+                throw new InvalidOperationException("Tried to open a context when one was already open. This shouldn't happen.");
+            }
+
+            try
+            {
+                this.context = this.logs.CreateContext(this.StreamId, this.MethodName, this.LastToken, this.CurrentToken, this.State);
+            }
+            catch (Exception exception)
+            {
+                this.logs.ContextCreateFailedWithException(exception);
+                throw;
+            }
+        }
+
+        private void Close()
+        {
+            if (this.context == null)
+            {
+                return;
+            }
+
+            try
+            {
+                this.context.Dispose();
+            }
+            catch (Exception exception)
+            {
+                this.logs.ContextDisposeFailedWithException(exception);
+                throw;
+            }
+
+            this.context = default;
+        }
+
+        private void Refresh()
+        {
+            this.Close();
+            this.Open();
+        }
+
+        private void ValidateStreamState(RecoverableStreamState<TState> streamState)
+        {
+            if (streamState == null)
+            {
+                return;
+            }
+
+            if (streamState.StreamId == null)
+            {
+                throw new ArgumentException("Stream ID should be set", nameof(streamState));
+            }
+        }
+
+        public void UpdateStreamState(RecoverableStreamState<TState> streamState)
+        {
+            if (streamState == null) { throw new ArgumentNullException(nameof(streamState), "Stream State shouldn't become null"); }
+            this.ValidateStreamState(streamState);
+
+            if (this.streamId.Guid != streamState.StreamId.Guid ||
+                this.streamId.Namespace != streamState.StreamId.Namespace)
+            {
+                throw new InvalidOperationException("Stream ID shouldn't change");
+            }
+
+            this.lastToken = streamState.GetToken();
+            this.State = streamState.ApplicationState;
+
+            this.Refresh();
+        }
+
+        public void Log(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext>> log) => log.Invoke(this.logs).Invoke(this.context);
+        public void Log<T1>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1>> log, T1 arg1) => log.Invoke(this.logs).Invoke(this.context, arg1);
+        public void Log<T1, T2>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2>> log, T1 arg1, T2 arg2) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2);
+        public void Log<T1, T2, T3>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2, T3>> log, T1 arg1, T2 arg2, T3 arg3) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2, arg3);
+        public void Log<T1, T2, T3, T4>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2, T3, T4>> log, T1 arg1, T2 arg2, T3 arg3, T4 arg4) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2, arg3, arg4);
+        public void Log<T1, T2, T3, T4, T5>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2, T3, T4, T5>> log, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2, arg3, arg4, arg5);
+    }
+
+    public interface IRecoverableStreamLogs<TLogContext, TState>
+        where TLogContext : IDisposable
+    {
+        TLogContext CreateContext(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, TState state);
+        
+        void ContextCreateFailedWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, TState state, Exception exception);
+
+        void ContextDisposeFailedWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, TState state, Exception exception);
+        
+        void ActivateInvoked(TLogContext context);
+        void ActivateCreatingNewState(TLogContext context);
+        void ActivateFoundExistingState(TLogContext context);
+        void ActivateFailedWithException(TLogContext context, Exception exception);
+        void ActivateSucceeded(TLogContext context);
+    }
+
     // TODO List:
     //   - Logging
     //   - Context scopes (Activity ID, AutoEvents context, etc.)
-    public class SimpleRecoverableStream<TState, TEvent> : ISimpleRecoverableStream<TState, TEvent>
+    public class SimpleRecoverableStream<TState, TEvent, TLogContext> : ISimpleRecoverableStream<TState, TEvent>
         where TState : new()
+        where TLogContext : IDisposable
     {
         private readonly IOrleansHooks<TEvent> orleansHooks;
 
         private ISimpleRecoverableStreamProcessor<TState, TEvent> processor;
         private RecoverableStreamStorage<TState> storage;
+        private IRecoverableStreamLogs<TLogContext, TState> logs;
 
         public SimpleRecoverableStream(IStreamIdentity streamId, IOrleansHooks<TEvent> orleansHooks)
         {
@@ -126,7 +304,7 @@ namespace Orleans.Streams
         {
             get
             {
-                if (this.storage.State == null)
+                if (this.storage?.State == null)
                 {
                     return default;
                 }
@@ -138,41 +316,67 @@ namespace Orleans.Streams
         public void Attach(
             ISimpleRecoverableStreamProcessor<TState, TEvent> processor,
             IAdvancedStorage<RecoverableStreamState<TState>> storage,
-            IRecoverableStreamStoragePolicy storagePolicy)
+            IRecoverableStreamStoragePolicy storagePolicy,
+            IRecoverableStreamLogs<TLogContext, TState> logs)
         {
             if (processor == null) { throw new ArgumentNullException(nameof(processor)); }
             if (storage == null) { throw new ArgumentNullException(nameof(storage)); }
             if (storagePolicy == null) { throw new ArgumentNullException(nameof(storagePolicy)); }
+            if (logs == null) { throw new ArgumentNullException(nameof(logs)); }
 
             if (this.processor != null)
             {
-                throw new InvalidOperationException("Stream already has Processor attached");
+                throw new InvalidOperationException("Stream is already attached.");
             }
 
             this.processor = processor;
             this.storage = new RecoverableStreamStorage<TState>(storage, storagePolicy);
+            this.logs = logs;
         }
 
         public async Task OnActivateAsync()
         {
-            this.CheckProcessorAttached();
+            this.CheckAttached();
 
-            await this.storage.Load();
-            if (this.storage.State == null) // TODO: Will this actually come back null? What's the expectation from Orleans IStorage?
+            using (var logger = this.CreateLogger())
             {
-                this.storage.State = new RecoverableStreamState<TState>
+                try
                 {
-                    StreamId = this.StreamId,
-                    ApplicationState = new TState()
-                };
-            }
+                    logger.Log(l => l.ActivateInvoked);
 
-            await this.SubscribeAsync();
+                    await this.storage.Load();
+                    if (this.storage.State == null) // TODO: Will this actually come back null? What's the expectation from Orleans IStorage?
+                    {
+                        this.storage.State = new RecoverableStreamState<TState>
+                        {
+                            StreamId = this.StreamId,
+                            ApplicationState = new TState()
+                        };
+
+                        logger.UpdateStreamState(this.storage.State);
+                        logger.Log(l => l.ActivateCreatingNewState);
+                    }
+                    else
+                    {
+                        logger.UpdateStreamState(this.storage.State);
+                        logger.Log(l => l.ActivateFoundExistingState);
+                    }
+
+                    await this.SubscribeAsync();
+
+                    logger.Log(l => l.ActivateSucceeded);
+                }
+                catch (Exception exception)
+                {
+                    logger.Log(l => l.ActivateFailedWithException, exception);
+                    throw;
+                }
+            }
         }
 
         public Task OnDeactivateAsync()
         {
-            this.CheckProcessorAttached();
+            this.CheckAttached();
 
             // TODO: Add an optimization where this doesn't save unless the token is different
             return this.storage.Save();
@@ -180,7 +384,7 @@ namespace Orleans.Streams
 
         public async Task OnEventAsync(TEvent @event, StreamSequenceToken token)
         {
-            this.CheckProcessorAttached();
+            this.CheckAttached();
 
             try
             {
@@ -232,12 +436,19 @@ namespace Orleans.Streams
             return Task.CompletedTask;
         }
 
-        private void CheckProcessorAttached()
+        private void CheckAttached()
         {
             if (this.processor == null)
             {
-                throw new InvalidOperationException("Stream does not have Processor attached");
+                throw new InvalidOperationException($"Stream has not been attached. Call {nameof(this.Attach)} before calling other methods.");
             }
+        }
+
+        private RecoverableStreamLogger<TLogContext, TState> CreateLogger(
+            StreamSequenceToken currentSequenceToken = null,
+            [CallerMemberName]string callerMethodName = null)
+        {
+            return new RecoverableStreamLogger<TLogContext, TState>(this.logs, this.storage.State, callerMethodName, currentSequenceToken);
         }
 
         private Task SubscribeAsync()
