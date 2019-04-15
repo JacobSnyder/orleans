@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using Orleans.Runtime;
 
 namespace Orleans.Streams
@@ -94,200 +96,302 @@ namespace Orleans.Streams
         void Attach(
             ISimpleRecoverableStreamProcessor<TState, TEvent> processor,
             IAdvancedStorage<RecoverableStreamState<TState>> storage,
-            IRecoverableStreamStoragePolicy storagePolicy);
+            IRecoverableStreamStoragePolicy storagePolicy,
+            IRecoverableStreamLogEvents logEvents,
+            IRecoverableStreamLogScopeFactory<TState> logScopeFactory);
 
         Task OnActivateAsync();
 
         Task OnDeactivateAsync();
     }
-
-    public sealed class RecoverableStreamLogger<TLogContext, TState> : IDisposable
-        where TLogContext : IDisposable
+    public sealed class DefaultRecoverableStreamLoggerScope : IDisposable
     {
-        private readonly IRecoverableStreamLogs<TLogContext, TState> logs;
+        public static IDisposable Instance { get; } = new DefaultRecoverableStreamLoggerScope();
 
-        private readonly IStreamIdentity streamId;
-        private readonly string methodName;
-        private StreamSequenceToken lastToken;
-        private StreamSequenceToken currentToken;
-        private TState state;
-
-        private TLogContext context;
-
-        public RecoverableStreamLogger(
-            IRecoverableStreamLogs<TLogContext, TState> logs,
-            RecoverableStreamState<TState> streamState,
-            string methodName,
-            StreamSequenceToken currentToken)
+        private DefaultRecoverableStreamLoggerScope()
         {
-            if (logs == null) { throw new ArgumentNullException(nameof(logs)); }
-            this.ValidateStreamState(streamState);
-            if (methodName == null) { throw new ArgumentNullException(nameof(methodName)); }
-
-            this.logs = logs;
-
-            this.streamId = streamState?.StreamId;
-            this.methodName = methodName;
-            this.lastToken = streamState?.GetToken();
-            this.currentToken = currentToken;
-
-            if (streamState != null)
-            {
-                this.state = streamState.ApplicationState;
-            }
-
-            this.Refresh();
-        }
-
-        public IStreamIdentity StreamId => this.streamId;
-
-        public string MethodName => this.methodName;
-
-        public StreamSequenceToken LastToken
-        {
-            get => this.lastToken;
-            set
-            {
-                this.lastToken = value;
-                this.Refresh();
-            }
-        }
-
-        public StreamSequenceToken CurrentToken
-        {
-            get => this.currentToken;
-            set
-            {
-                this.currentToken = value;
-                this.Refresh();
-            }
-        }
-
-        public TState State
-        {
-            get => this.state;
-            set
-            {
-                this.state = value;
-                this.Refresh();
-            }
         }
 
         public void Dispose()
         {
-            this.Close();
         }
-
-        private void Open()
-        {
-            if (this.context != null)
-            {
-                throw new InvalidOperationException("Tried to open a context when one was already open. This shouldn't happen.");
-            }
-
-            try
-            {
-                this.context = this.logs.CreateContext(this.StreamId, this.MethodName, this.LastToken, this.CurrentToken, this.State);
-            }
-            catch (Exception exception)
-            {
-                this.logs.ContextCreateFailedWithException(exception);
-                throw;
-            }
-        }
-
-        private void Close()
-        {
-            if (this.context == null)
-            {
-                return;
-            }
-
-            try
-            {
-                this.context.Dispose();
-            }
-            catch (Exception exception)
-            {
-                this.logs.ContextDisposeFailedWithException(exception);
-                throw;
-            }
-
-            this.context = default;
-        }
-
-        private void Refresh()
-        {
-            this.Close();
-            this.Open();
-        }
-
-        private void ValidateStreamState(RecoverableStreamState<TState> streamState)
-        {
-            if (streamState == null)
-            {
-                return;
-            }
-
-            if (streamState.StreamId == null)
-            {
-                throw new ArgumentException("Stream ID should be set", nameof(streamState));
-            }
-        }
-
-        public void UpdateStreamState(RecoverableStreamState<TState> streamState)
-        {
-            if (streamState == null) { throw new ArgumentNullException(nameof(streamState), "Stream State shouldn't become null"); }
-            this.ValidateStreamState(streamState);
-
-            if (this.streamId.Guid != streamState.StreamId.Guid ||
-                this.streamId.Namespace != streamState.StreamId.Namespace)
-            {
-                throw new InvalidOperationException("Stream ID shouldn't change");
-            }
-
-            this.lastToken = streamState.GetToken();
-            this.State = streamState.ApplicationState;
-
-            this.Refresh();
-        }
-
-        public void Log(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext>> log) => log.Invoke(this.logs).Invoke(this.context);
-        public void Log<T1>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1>> log, T1 arg1) => log.Invoke(this.logs).Invoke(this.context, arg1);
-        public void Log<T1, T2>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2>> log, T1 arg1, T2 arg2) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2);
-        public void Log<T1, T2, T3>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2, T3>> log, T1 arg1, T2 arg2, T3 arg3) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2, arg3);
-        public void Log<T1, T2, T3, T4>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2, T3, T4>> log, T1 arg1, T2 arg2, T3 arg3, T4 arg4) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2, arg3, arg4);
-        public void Log<T1, T2, T3, T4, T5>(Func<IRecoverableStreamLogs<TLogContext, TState>, Action<TLogContext, T1, T2, T3, T4, T5>> log, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5) => log.Invoke(this.logs).Invoke(this.context, arg1, arg2, arg3, arg4, arg5);
     }
 
-    public interface IRecoverableStreamLogs<TLogContext, TState>
-        where TLogContext : IDisposable
+    // TODO: There should be a "master" logger that is owned by everybody. That guy should own the current scope. Everybody else can be constructed with him. That way we don't have to pass him around all over. If somebody tries to log and we don't have a scope we should log. Scopes can be opened. Unclear if we should allow anybody to update the current scope or only the person that opened it. For now, let's assume that it's only the guy that opened the scope. It's a slippery slope because if we allow anybody to update the current scope, should we allow anybody to close it? Thinking more about it I think we should allow anybody to update the current scope so that we can have the storage layer update it if it needed it load.
+    public sealed class RecoverableStreamLogger<TState> : IDisposable
     {
-        TLogContext CreateContext(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, TState state);
-        
-        void ContextCreateFailedWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, TState state, Exception exception);
+        private readonly IRecoverableStreamLogScopeFactory<TState> logScopeFactory;
+        private readonly IStreamIdentity streamId;
 
-        void ContextDisposeFailedWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, TState state, Exception exception);
-        
-        void ActivateInvoked(TLogContext context);
-        void ActivateCreatingNewState(TLogContext context);
-        void ActivateFoundExistingState(TLogContext context);
-        void ActivateFailedWithException(TLogContext context, Exception exception);
-        void ActivateSucceeded(TLogContext context);
+        private IDisposable currentScope;
+
+        public RecoverableStreamLogger(
+            IRecoverableStreamLogEvents logEvents,
+            IRecoverableStreamLogScopeFactory<TState> logScopeFactory,
+            IStreamIdentity streamId)
+        {
+            if (logEvents == null) { throw new ArgumentNullException(nameof(logEvents)); }
+            if (logScopeFactory == null) { throw new ArgumentNullException(nameof(logScopeFactory)); }
+            if (streamId == null) { throw new ArgumentNullException(nameof(streamId)); }
+
+            this.LogEvents = logEvents;
+            this.logScopeFactory = logScopeFactory;
+            this.streamId = streamId;
+        }
+
+        public IRecoverableStreamLogEvents LogEvents { get; }
+
+        public void Dispose()
+        {
+            this.CloseScope(null, null, null);
+        }
+
+        public IDisposable OpenScope(RecoverableStreamState<TState> streamingState, StreamSequenceToken currentToken, [CallerMemberName] string methodName = null)
+        {
+            if (this.currentScope != null)
+            {
+                this.LogEvents.LoggerOpenScopeInvokedWhenScopeAlreadyOpen();
+                return this.currentScope;
+            }
+
+            TState applicationState = default;
+            if (streamingState != null)
+            {
+                applicationState = streamingState.ApplicationState;
+            }
+
+            try
+            {
+                this.currentScope = this.logScopeFactory.BeginScope(this.streamId, methodName, streamingState?.GetToken(), currentToken, applicationState);
+
+                if (this.currentScope == null)
+                {
+                    this.currentScope = DefaultRecoverableStreamLoggerScope.Instance;
+                }
+            }
+            catch (Exception exception)
+            {
+                this.LogEvents.LoggerOpenScopeFailedToBeginScopeWithException(this.streamId, methodName, streamingState?.GetToken(), currentToken, exception);
+            }
+
+            return this.currentScope;
+        }
+
+        public void UpdateScope(RecoverableStreamState<TState> streamingState, StreamSequenceToken currentToken, [CallerMemberName] string methodName = null)
+        {
+            if (this.currentScope == null)
+            {
+                this.LogEvents.LoggerUpdateScopeInvokedWhenNoScopeOpen(this.streamId, methodName, streamingState?.GetToken(), currentToken);
+                return;
+            }
+
+            this.CloseScope(streamingState, currentToken, methodName);
+            this.OpenScope(streamingState, currentToken, methodName);
+        }
+
+        private void CloseScope(RecoverableStreamState<TState> streamingState, StreamSequenceToken currentToken, string methodName)
+        {
+            if (this.currentScope == null)
+            {
+                return;
+            }
+
+            try
+            {
+                this.currentScope.Dispose();
+            }
+            catch (Exception exception)
+            {
+                this.LogEvents.LoggerCloseScopeFailedToDisposeWithException(this.streamId, methodName, streamingState?.GetToken(), currentToken, exception);
+            }
+            finally
+            {
+                this.currentScope = null;
+            }
+        }
     }
 
-    // TODO List:
-    //   - Logging
-    //   - Context scopes (Activity ID, AutoEvents context, etc.)
-    public class SimpleRecoverableStream<TState, TEvent, TLogContext> : ISimpleRecoverableStream<TState, TEvent>
+    public interface IRecoverableStreamLogScopeFactory<TState>
+    {
+        IDisposable BeginScope(IStreamIdentity streamId, string methodName, StreamSequenceToken lastToken, StreamSequenceToken currentToken, TState state);
+    }
+
+    public class DefaultRecoverableStreamLogScopeFactory<TState> : IRecoverableStreamLogScopeFactory<TState>
+    {
+        private readonly ILogger logger;
+        private readonly IRecoverableStreamLogScopeApplicationScopeStateProducer<TState> applicationScopeStateProducer;
+
+        public DefaultRecoverableStreamLogScopeFactory(ILogger logger, IRecoverableStreamLogScopeApplicationScopeStateProducer<TState> applicationScopeStateProducer)
+        {
+            if (logger == null) { throw new ArgumentNullException(nameof(logger)); }
+            if (applicationScopeStateProducer == null) { throw new ArgumentNullException(nameof(applicationScopeStateProducer)); }
+
+            this.logger = logger;
+            this.applicationScopeStateProducer = applicationScopeStateProducer;
+        }
+
+        public IDisposable BeginScope(IStreamIdentity streamId, string methodName, StreamSequenceToken lastToken, StreamSequenceToken currentToken, TState state)
+        {
+            var scopeState = new List<KeyValuePair<string, object>>
+            {
+                new KeyValuePair<string, object>("StreamNamespace", streamId?.Namespace),
+                new KeyValuePair<string, object>("StreamGuid", streamId?.Guid),
+                new KeyValuePair<string, object>("LastToken", lastToken),
+                new KeyValuePair<string, object>("CurrentToken", currentToken)
+            };
+
+            var applicationScopeState = this.applicationScopeStateProducer.GetState(state);
+            if (applicationScopeState != null)
+            {
+                scopeState.AddRange(applicationScopeState);
+            }
+
+            return this.logger.BeginScope(scopeState);
+        }
+    }
+
+    public interface IRecoverableStreamLogScopeApplicationScopeStateProducer<TState>
+    {
+        IEnumerable<KeyValuePair<string, object>> GetState(TState state);
+    }
+
+    public class DefaultRecoverableStreamLogScopeApplicationScopeStateProducer<TState> : IRecoverableStreamLogScopeApplicationScopeStateProducer<TState>
+    {
+        public IEnumerable<KeyValuePair<string, object>> GetState(TState state) => Array.Empty<KeyValuePair<string, object>>();
+    }
+
+    public class HaloRecoverableStreamLogScopeApplicationScopeStateProducer : IRecoverableStreamLogScopeApplicationScopeStateProducer<HaloState>
+    {
+        public IEnumerable<KeyValuePair<string, object>> GetState(HaloState state)
+        {
+            return new[]
+            {
+                new KeyValuePair<string, object>(nameof(HaloState.MatchId), state.MatchId), 
+            };
+        }
+    }
+
+    public class HaloRecoverableStreamLogScopeFactory : IRecoverableStreamLogScopeFactory<HaloState>
+    {
+        public IDisposable BeginScope(IStreamIdentity streamId, string methodName, StreamSequenceToken lastToken, StreamSequenceToken currentToken, HaloState state)
+        {
+            // TODO: Set ActivityId scope
+            // TODO: Set AutoEvents context
+            return null;
+        }
+    }
+
+    public interface IRecoverableStreamLogEvents
+    {
+        void LoggerOpenScopeInvokedWhenScopeAlreadyOpen();
+        void LoggerOpenScopeFailedToBeginScopeWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, Exception exception);
+        void LoggerUpdateScopeInvokedWhenNoScopeOpen(IStreamIdentity streamId, string methodName, StreamSequenceToken lastToken, StreamSequenceToken currentToken);
+        void LoggerCloseScopeFailedToDisposeWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, Exception exception);
+
+        void ActivateInvoked();
+        void ActivateCreatingNewState();
+        void ActivateFoundExistingState();
+        void ActivateFailedWithException(Exception exception);
+        void ActivateSucceeded();
+        void DeactivateInvoked();
+        void DeactivateSucceeded();
+        void DeactivateFailedWithException(Exception exception);
+        void OnEventInvoked();
+        void OnEventEncounteredDuplicateEvent();
+        void OnEventSavingStartToken();
+        void OnEventSavingAsRequestedByProcessor();
+        void OnEventSucceeded();
+        void OnEventFailedWithException(Exception exception);
+        void OnErrorInvokedWithException(Exception exception);
+        void SubscribeSucceeded(StreamSequenceToken token);
+        void SubscribeFailedWithException(StreamSequenceToken token, Exception exception);
+    }
+
+    public class DefaultRecoverableStreamLogEvents : IRecoverableStreamLogEvents
+    {
+        private readonly ILogger logger;
+
+        public DefaultRecoverableStreamLogEvents(ILogger logger)
+        {
+            if (this.logger == null) { throw new ArgumentNullException(nameof(logger)); }
+
+            this.logger = logger;
+        }
+
+        public void LoggerOpenScopeInvokedWhenScopeAlreadyOpen() => this.logger.LogWarning("Logger OpenScope() invoked when there was already an open scope. The invocation will be ignored and the previously open scope will continue to be used.");
+
+        public void LoggerOpenScopeFailedToBeginScopeWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, Exception exception) => throw new NotImplementedException();
+
+        public void LoggerUpdateScopeInvokedWhenNoScopeOpen(IStreamIdentity streamId, string methodName, StreamSequenceToken lastToken, StreamSequenceToken currentToken) => throw new NotImplementedException();
+
+        public void LoggerCloseScopeFailedToDisposeWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, Exception exception) => throw new NotImplementedException();
+
+        public void ActivateInvoked() => throw new NotImplementedException();
+
+        public void ActivateCreatingNewState() => throw new NotImplementedException();
+
+        public void ActivateFoundExistingState() => throw new NotImplementedException();
+
+        public void ActivateFailedWithException(Exception exception) => throw new NotImplementedException();
+
+        public void ActivateSucceeded() => throw new NotImplementedException();
+    }
+
+    public class HaloRecoverableStreamLogEvents : IRecoverableStreamLogEvents
+    {
+        public void LoggerOpenScopeInvokedWhenScopeAlreadyOpen() => throw new NotImplementedException();
+
+        public void LoggerOpenScopeFailedToBeginScopeWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, Exception exception) => throw new NotImplementedException();
+
+        public void LoggerUpdateScopeInvokedWhenNoScopeOpen(IStreamIdentity streamId, string methodName, StreamSequenceToken lastToken, StreamSequenceToken currentToken) => throw new NotImplementedException();
+
+        public void LoggerCloseScopeFailedToDisposeWithException(IStreamIdentity streamId, string methodName, StreamSequenceToken lastSequenceToken, StreamSequenceToken currentSequenceToken, Exception exception) => throw new NotImplementedException();
+
+        public void ActivateInvoked() => throw new NotImplementedException();
+
+        public void ActivateCreatingNewState() => throw new NotImplementedException();
+
+        public void ActivateFoundExistingState() => throw new NotImplementedException();
+
+        public void ActivateFailedWithException(Exception exception) => throw new NotImplementedException();
+
+        public void ActivateSucceeded() => throw new NotImplementedException();
+
+        public void DeactivateInvoked() => throw new NotImplementedException();
+
+        public void DeactivateSucceeded() => throw new NotImplementedException();
+
+        public void DeactivateFailedWithException(Exception exception) => throw new NotImplementedException();
+
+        public void OnEventInvoked() => throw new NotImplementedException();
+
+        public void OnEventEncounteredDuplicateEvent() => throw new NotImplementedException();
+
+        public void OnEventSavingStartToken() => throw new NotImplementedException();
+
+        public void OnEventSavingAsRequestedByProcessor() => throw new NotImplementedException();
+
+        public void OnEventSucceeded() => throw new NotImplementedException();
+
+        public void OnEventFailedWithException(Exception exception) => throw new NotImplementedException();
+
+        public void OnErrorInvokedWithException(Exception exception) => throw new NotImplementedException();
+
+        public void SubscribeSucceeded(StreamSequenceToken token) => throw new NotImplementedException();
+
+        public void SubscribeFailedWithException(StreamSequenceToken token, Exception exception) => throw new NotImplementedException();
+    }
+
+    public class SimpleRecoverableStream<TState, TEvent> : ISimpleRecoverableStream<TState, TEvent>
         where TState : new()
-        where TLogContext : IDisposable
     {
         private readonly IOrleansHooks<TEvent> orleansHooks;
 
         private ISimpleRecoverableStreamProcessor<TState, TEvent> processor;
+        private RecoverableStreamLogger<TState> logger;
         private RecoverableStreamStorage<TState> storage;
-        private IRecoverableStreamLogs<TLogContext, TState> logs;
+
+        private StreamSequenceToken expectedNextSequenceToken;
 
         public SimpleRecoverableStream(IStreamIdentity streamId, IOrleansHooks<TEvent> orleansHooks)
         {
@@ -317,12 +421,14 @@ namespace Orleans.Streams
             ISimpleRecoverableStreamProcessor<TState, TEvent> processor,
             IAdvancedStorage<RecoverableStreamState<TState>> storage,
             IRecoverableStreamStoragePolicy storagePolicy,
-            IRecoverableStreamLogs<TLogContext, TState> logs)
+            IRecoverableStreamLogEvents logEvents,
+            IRecoverableStreamLogScopeFactory<TState> logScopeFactory)
         {
             if (processor == null) { throw new ArgumentNullException(nameof(processor)); }
             if (storage == null) { throw new ArgumentNullException(nameof(storage)); }
             if (storagePolicy == null) { throw new ArgumentNullException(nameof(storagePolicy)); }
-            if (logs == null) { throw new ArgumentNullException(nameof(logs)); }
+            if (logEvents == null) { throw new ArgumentNullException(nameof(logEvents)); }
+            if (logScopeFactory == null) { throw new ArgumentNullException(nameof(logScopeFactory)); }
 
             if (this.processor != null)
             {
@@ -330,19 +436,19 @@ namespace Orleans.Streams
             }
 
             this.processor = processor;
+            this.logger = new RecoverableStreamLogger<TState>(logEvents, logScopeFactory, this.StreamId);
             this.storage = new RecoverableStreamStorage<TState>(storage, storagePolicy);
-            this.logs = logs;
         }
 
         public async Task OnActivateAsync()
         {
             this.CheckAttached();
 
-            using (var logger = this.CreateLogger())
+            using (this.logger.OpenScope(this.storage.State, currentToken: null))
             {
                 try
                 {
-                    logger.Log(l => l.ActivateInvoked);
+                    this.logger.LogEvents.ActivateInvoked();
 
                     await this.storage.Load();
                     if (this.storage.State == null) // TODO: Will this actually come back null? What's the expectation from Orleans IStorage?
@@ -353,86 +459,118 @@ namespace Orleans.Streams
                             ApplicationState = new TState()
                         };
 
-                        logger.UpdateStreamState(this.storage.State);
-                        logger.Log(l => l.ActivateCreatingNewState);
+                        this.logger.UpdateScope(this.storage.State, currentToken: null);
+                        this.logger.LogEvents.ActivateCreatingNewState();
                     }
                     else
                     {
-                        logger.UpdateStreamState(this.storage.State);
-                        logger.Log(l => l.ActivateFoundExistingState);
+                        this.logger.UpdateScope(this.storage.State, currentToken: null);
+                        this.logger.LogEvents.ActivateFoundExistingState();
                     }
 
                     await this.SubscribeAsync();
 
-                    logger.Log(l => l.ActivateSucceeded);
+                    this.logger.LogEvents.ActivateSucceeded();
                 }
                 catch (Exception exception)
                 {
-                    logger.Log(l => l.ActivateFailedWithException, exception);
+                    this.logger.LogEvents.ActivateFailedWithException(exception);
                     throw;
                 }
             }
         }
 
-        public Task OnDeactivateAsync()
+        public async Task OnDeactivateAsync()
         {
             this.CheckAttached();
 
-            // TODO: Add an optimization where this doesn't save unless the token is different
-            return this.storage.Save();
+            using (this.logger.OpenScope(this.storage.State, currentToken: null))
+            {
+                try
+                {
+                    this.logger.LogEvents.DeactivateInvoked();
+
+                    // TODO: Add an optimization where this doesn't save unless the token is different
+                    await this.storage.Save();
+
+                    this.logger.LogEvents.DeactivateSucceeded();
+                }
+                catch (Exception exception)
+                {
+                    this.logger.LogEvents.DeactivateFailedWithException(exception);
+                    throw;
+                }
+            }
         }
 
-        public async Task OnEventAsync(TEvent @event, StreamSequenceToken token)
+        private async Task OnEventAsync(TEvent @event, StreamSequenceToken token)
         {
-            this.CheckAttached();
-
-            try
+            using (this.logger.OpenScope(this.storage.State, token))
             {
-                if (this.storage.State.IsDuplicateEvent(token))
+                try
                 {
-                    return;
-                }
+                    this.logger.LogEvents.OnEventInvoked();
 
-                // Save the start token so that if we enter recovery the token isn't null
-                if (this.storage.State.StartToken == null)
-                {
-                    this.storage.State.SetStartToken(token);
-
-                    var saveFastForwarded = await this.SaveAsync();
-
-                    if (saveFastForwarded)
+                    if (this.storage.State.IsDuplicateEvent(token))
                     {
-                        // We fast-forwarded so it's possible that we skipped over this event and it is now considered a duplicate. Reevaluate its duplicate status.
-                        if (this.storage.State.IsDuplicateEvent(token))
+                        this.logger.LogEvents.OnEventEncounteredDuplicateEvent();
+
+                        return;
+                    }
+
+                    // Save the start token so that if we enter recovery the token isn't null
+                    if (this.storage.State.StartToken == null)
+                    {
+                        this.logger.LogEvents.OnEventSavingStartToken();
+
+                        this.storage.State.SetStartToken(token);
+
+                        var saveFastForwarded = await this.SaveAsync();
+
+                        if (saveFastForwarded)
                         {
-                            return;
+                            // We fast-forwarded so it's possible that we skipped over this event and it is now considered a duplicate. Reevaluate its duplicate status.
+                            if (this.storage.State.IsDuplicateEvent(token))
+                            {
+                                this.logger.LogEvents.OnEventEncounteredDuplicateEvent();
+
+                                return;
+                            }
                         }
                     }
+
+                    this.storage.State.SetCurrentToken(token);
+
+                    var processorRequestsSave = await this.processor.OnEventAsync(this.storage.State.ApplicationState, @event);
+
+                    if (processorRequestsSave)
+                    {
+                        this.logger.LogEvents.OnEventSavingAsRequestedByProcessor();
+
+                        await this.SaveAsync();
+                    }
+                    else
+                    {
+                        await this.CheckpointIfOverdueAsync();
+                    }
+
+                    this.logger.LogEvents.OnEventSucceeded();
                 }
-
-                this.storage.State.SetCurrentToken(token);
-
-                var processorRequestsSave = await this.processor.OnEventAsync(this.storage.State.ApplicationState, @event);
-
-                if (processorRequestsSave)
+                catch (Exception exception)
                 {
-                    await this.SaveAsync();
-                }
-                else
-                {
-                    await this.CheckpointIfOverdueAsync();
-                }
-            }
-            catch
-            {
-                this.orleansHooks.DeactivateOnIdle();
+                    this.logger.LogEvents.OnEventFailedWithException(exception);
 
-                throw;
+                    this.orleansHooks.DeactivateOnIdle();
+
+                    throw;
+                }
             }
         }
 
-        public Task OnErrorAsync(Exception exception)
+        private Task OnErrorAsync(Exception exception)
         {
+            this.logger.LogEvents.OnErrorInvokedWithException(exception);
+
             return Task.CompletedTask;
         }
 
@@ -444,16 +582,23 @@ namespace Orleans.Streams
             }
         }
 
-        private RecoverableStreamLogger<TLogContext, TState> CreateLogger(
-            StreamSequenceToken currentSequenceToken = null,
-            [CallerMemberName]string callerMethodName = null)
+        private async Task SubscribeAsync()
         {
-            return new RecoverableStreamLogger<TLogContext, TState>(this.logs, this.storage.State, callerMethodName, currentSequenceToken);
-        }
+            var token = this.storage.State.GetToken();
 
-        private Task SubscribeAsync()
-        {
-            return this.orleansHooks.SubscribeAsync(this.StreamId, this.OnEventAsync, this.OnErrorAsync, this.storage.State.GetToken());
+            try
+            {
+                await this.orleansHooks.SubscribeAsync(this.StreamId, this.OnEventAsync, this.OnErrorAsync, token);
+
+                this.expectedNextSequenceToken = token;
+
+                this.logger.LogEvents.SubscribeSucceeded(token);
+            }
+            catch (Exception exception)
+            {
+                this.logger.LogEvents.SubscribeFailedWithException(token, exception);
+                throw;
+            }
         }
 
         private Task<bool> CheckpointIfOverdueAsync()
@@ -468,6 +613,8 @@ namespace Orleans.Streams
 
         private async Task<bool> PersistAsync(bool isCheckpoint)
         {
+            // TODO: Logging
+
             bool fastForwardRequested;
             if (isCheckpoint)
             {
@@ -488,11 +635,12 @@ namespace Orleans.Streams
         }
     }
 
-    public class SimpleState
+    public class HaloState
     {
+        public Guid MatchId { get; set; }
     }
     
-    public class SimpleEvent
+    public class HaloEventBase
     {
     }
 
@@ -534,9 +682,9 @@ namespace Orleans.Streams
         }
     }
 
-    public class HaloStreamProcessor : SimpleRecoverableStreamProcessorBase<SimpleState, SimpleEvent>
+    public class HaloStreamProcessor : SimpleRecoverableStreamProcessorBase<HaloState, HaloEventBase>
     {
-        public override Task<bool> OnEventAsync(SimpleState state, SimpleEvent @event)
+        public override Task<bool> OnEventAsync(HaloState state, HaloEventBase @event)
         {
             // TODO: Setup if dynamic stats isn't setup or state is different, setup dynamic stats
             // TODO: Ingest event into dynamic stats
@@ -572,9 +720,11 @@ namespace Orleans.Streams
         public TimeSpan GetWriteBackoff(AdvancedStorageWriteResultCode resultCode, int attempts) => throw new NotImplementedException();
     }
 
+    [ImplicitStreamSubscription("TestStreamNamespace1")]
+    [ImplicitStreamSubscription("TestStreamNamespace2")]
     public class SimpleRecoverableStreamingGrain : Grain
     {
-        private readonly ISimpleRecoverableStream<SimpleState, SimpleEvent> stream;
+        private readonly ISimpleRecoverableStream<HaloState, HaloEventBase> stream;
 
         // Orleans ctor, invoked via DI
         public SimpleRecoverableStreamingGrain(IGrainActivationContext grainActivationContext)
@@ -585,20 +735,23 @@ namespace Orleans.Streams
             Guid streamGuid = grainActivationContext.GrainIdentity.GetPrimaryKey(out string streamNamespace);
             var streamId = new StreamIdentity(streamGuid, streamNamespace);
 
-            var orleansHooks = new OrleansHooks<SimpleEvent>(
+            var orleansHooks = new OrleansHooks<HaloEventBase>(
                 new HaloStreamProviderNameResolver(),
                 this.GetStreamProvider,
                 this.DeactivateOnIdle);
 
-            this.stream = new SimpleRecoverableStream<SimpleState, SimpleEvent>(streamId, orleansHooks);
+            this.stream = new SimpleRecoverableStream<HaloState, HaloEventBase>(streamId, orleansHooks);
 
             var streamProcessor = new HaloStreamProcessor();
 
-            var storage = new HaloAdvancedStorage<RecoverableStreamState<SimpleState>>();
+            var storage = new HaloAdvancedStorage<RecoverableStreamState<HaloState>>();
 
             var storagePolicy = new HaloStoragePolicy();
 
-            this.stream.Attach(streamProcessor, storage, storagePolicy);
+            var logEvents = new HaloRecoverableStreamLogEvents();
+            var logScopeFactory = new HaloRecoverableStreamLogScopeFactory();
+
+            this.stream.Attach(streamProcessor, storage, storagePolicy, logEvents, logScopeFactory);
         }
 
         public override async Task OnActivateAsync()
